@@ -2,6 +2,7 @@ import numpy as np
 from quaternion import (rotation_matrix_hamilton, quat_product, quat_from_rotvec, quat_normalize,
                         jacobian_q_dtheta, jacobian_rotT_vec_q)
 from linalg_utils import skew
+from sensors import Sensor
 
 class ESKF():
 
@@ -27,7 +28,7 @@ class ESKF():
         self.F_i[3:15, 0:12] = np.eye(12)
 
 
-    def predict(self, a_meas, w_meas, dt):
+    def _predict(self, a_meas, w_meas, dt):
         self.R = rotation_matrix_hamilton(self.q)
         a = a_meas - self.b_a
         w = w_meas - self.b_g
@@ -55,7 +56,7 @@ class ESKF():
         self._update(p_meas, h_x, H, V)
 
     def update_mag(self, m_meas, sigma_mag):
-        # h(x) = R(q)^T r: Earth field (NED) seen in body axes (eq. 53, transposed)
+        # h(x) = R(q)^T r: Earth field (NED) seen in body axes
         if self.mag_ref is None:
             raise ValueError("mag_ref (Earth magnetic field in NED) is not set")
 
@@ -82,8 +83,7 @@ class ESKF():
         self._update(a_meas, h_x, H, V)
 
     def update_baro(self, z_meas, sigma_baro):
-        # h(x) = p_z (eq. 71). z_meas is NED z (positive down), already converted
-        # from pressure (appendix B): z = -(altitude - altitude_ref)
+
         h_x = self.p[2:3]
 
         H_x = np.zeros((1, 16))
@@ -93,6 +93,16 @@ class ESKF():
         V = np.array([[sigma_baro ** 2]])
 
         self._update(np.atleast_1d(z_meas), h_x, H, V)
+
+    def run(self, a_meas, w_meas, dt, sensors: Sensor):
+        self._predict(a_meas=a_meas, w_meas=w_meas, dt=dt)
+
+        for s in sensors:
+            if s.has_new_data():
+                getattr(self, f"update_{s.kind}")(s.data, s.sigma)
+                s.last_ts = s.ts
+
+
 
     def _update(self, y, h_x, H, V):
         # gain and innovation 
