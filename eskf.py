@@ -43,17 +43,18 @@ class ESKF():
 
         self.P = Phi @ self.P @ Phi.T + self.F_i @ Q_i @ self.F_i.T
 
-    def update_gps(self, p_meas, sigma_gps):
+    def update_gps(self, p_meas, v_meas, sigma_p, sigma_v):
         # h(x) = p
-        h_x = self.p
+        y = np.concatenate([p_meas, v_meas])
+        h_x = np.concatenate([self.p, self.v])
 
-        H_x = np.zeros((3, 16))
-        H_x[:, 0:3] = np.eye(3)
+        H_x = np.zeros((6, 16))
+        H_x[:3, 0:3] = np.eye(3)
+        H_x[3:, 3:6] = np.eye(3)
         H = self._observation_jacobian(H_x)
 
-        V = np.diag(np.broadcast_to(sigma_gps, 3) ** 2)
-
-        self._update(p_meas, h_x, H, V)
+        V = np.diag(np.concatenate([np.broadcast_to(sigma_p, 3), np.broadcast_to(sigma_v, 3)]) ** 2)
+        self._update(y, h_x, H, V)
 
     def update_mag(self, m_meas, sigma_mag):
         # h(x) = R(q)^T r: Earth field (NED) seen in body axes
