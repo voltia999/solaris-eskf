@@ -2,6 +2,7 @@ import numpy as np
 import pytest
 from pytest import approx
 from eskf import ESKF
+from linalg_utils import skew
 from quaternion import (quat_to_euler, quat_product, quat_conjugate, quat_from_rotvec, rotvec_from_quat,
                         rotation_matrix_hamilton, jacobian_rotT_vec_q)
 
@@ -20,7 +21,7 @@ def test_rest():
     T = 10
 
     for _ in range(round(T/dt)):
-        eskf.predict(a_meas=A_REST, w_meas=np.zeros(3), dt=dt)
+        eskf._predict(a_meas=A_REST, w_meas=np.zeros(3), dt=dt)
 
     assert eskf.p == approx(np.zeros(3))
     assert eskf.v == approx(np.zeros(3))
@@ -33,7 +34,7 @@ def test_rotation():
     T = 1
 
     for _ in range(round(T/dt)):
-        eskf.predict(a_meas=A_REST, w_meas=w_meas, dt=dt)
+        eskf._predict(a_meas=A_REST, w_meas=w_meas, dt=dt)
 
     assert quat_to_euler(eskf.q) == approx((0.0, 0.0, 0.5))
 
@@ -44,7 +45,7 @@ def test_quat_norm():
     T = 100
 
     for _ in range(round(T/dt)):
-        eskf.predict(a_meas=A_REST, w_meas=w_meas, dt=dt)
+        eskf._predict(a_meas=A_REST, w_meas=w_meas, dt=dt)
 
     assert np.linalg.norm(eskf.q) == approx(1.0)
 
@@ -58,7 +59,7 @@ def run_noisy(steps=500, dt=0.01):
     traces = [np.trace(eskf.P)]
 
     for _ in range(steps):
-        eskf.predict(a_meas=A_REST + rng.normal(size=3), w_meas=rng.normal(size=3) * 0.3, dt=dt)
+        eskf._predict(a_meas=A_REST + rng.normal(size=3), w_meas=rng.normal(size=3) * 0.3, dt=dt)
         traces.append(np.trace(eskf.P))
 
     return eskf, np.array(traces)
@@ -84,7 +85,7 @@ def test_covariance_gyro_noise_only():
     eskf.P = np.zeros((15, 15))
 
     for _ in range(N):
-        eskf.predict(a_meas=A_REST, w_meas=np.zeros(3), dt=dt)
+        eskf._predict(a_meas=A_REST, w_meas=np.zeros(3), dt=dt)
 
     np.testing.assert_allclose(np.diag(eskf.P)[6:9], N * sigma_w ** 2 * dt ** 2)
 
@@ -119,7 +120,7 @@ def test_transition_matrix_finite_differences():
     set_state(nominal, *state)
     nominal.R = rotation_matrix_hamilton(nominal.q)
     Phi = nominal._transition_matrix(a_meas - nominal.b_a, (w_meas - nominal.b_g) * dt, dt)
-    nominal.predict(a_meas, w_meas, dt)
+    nominal._predict(a_meas, w_meas, dt)
 
     eps = 1e-6
     for i in range(15):
@@ -127,13 +128,13 @@ def test_transition_matrix_finite_differences():
         dx[i] = eps
         perturbed = make_eskf()
         set_state(perturbed, *inject(*state, dx))
-        perturbed.predict(a_meas, w_meas, dt)
+        perturbed._predict(a_meas, w_meas, dt)
 
         np.testing.assert_allclose(error_between(nominal, perturbed), Phi @ dx, atol=1e-10,
                                    err_msg=f"column {i} of Phi")
 
 
-# --- magnetometer update ---
+# magnetometer update
 
 MAG_REF = np.array([26.0, -0.5, 37.0])
 
@@ -164,7 +165,7 @@ def test_mag_corrects_yaw():
     eskf.P = np.diag([1e-2] * 6 + [1e-6, 1e-6, 0.5 ** 2] + [1e-4] * 3 + [1e-6] * 3)
 
     for k in range(500):
-        eskf.predict(a_meas=A_REST, w_meas=np.zeros(3), dt=0.01)
+        eskf._predict(a_meas=A_REST, w_meas=np.zeros(3), dt=0.01)
         if k % 10 == 0:
             eskf.update_mag(MAG_REF, sigma_mag=0.5)
 
@@ -176,7 +177,7 @@ def test_mag_requires_reference():
         eskf.update_mag(MAG_REF, sigma_mag=0.5)
 
 
-# --- barometer update ---
+# barometer update
 
 def test_baro_corrects_only_z():
     eskf = make_eskf()
@@ -194,3 +195,96 @@ def test_baro_accepts_array_measurement():
     eskf = make_eskf()
     eskf.update_baro(z_meas=np.array([1.0]), sigma_baro=0.5)
     assert eskf.p.shape == (3,)
+
+
+# gps update
+
+def test_gps_linear_kf():
+    eskf = make_eskf()
+    eskf.p = np.random.normal(size=3)
+    eskf.v = np.random.normal(size=3)
+    A = np.random.normal(size=(15, 15))
+    eskf.P = A @ A.T + np.eye(15)
+
+    p_meas = eskf.p + np.random.normal(size=3)
+    v_meas = eskf.v + np.random.normal(size=3)
+    sigma_p, sigma_v = 0.7, 0.2
+
+    x0 = np.concatenate([eskf.p, eskf.v])
+    P0 = eskf.P.copy()
+    y = np.concatenate([p_meas, v_meas])
+
+    H = np.zeros((6,15))
+    H[:, 0:6] = np.eye(6)
+    V = np.diag([sigma_p**2] * 3 + [sigma_v**2] * 3)
+
+    K = P0 @ H.T @ np.linalg.inv(H @ P0 @ H.T + V)
+    dx = K @ (y - x0)
+    I_KH = np.eye(15) - K @ H
+    P_kf = I_KH @ P0 @ I_KH.T + K @ V @ K.T
+
+    eskf.update_gps(p_meas, v_meas, sigma_p, sigma_v)
+
+    np.testing.assert_allclose(eskf.p, x0[0:3] + dx[0:3], atol=1e-12)
+    np.testing.assert_allclose(eskf.v, x0[3:6] + dx[3:6], atol=1e-12)
+
+    G = np.eye(15)
+    G[6:9, 6:9] = np.eye(3) - skew(0.5 * dx[6:9])
+    np.testing.assert_allclose(eskf.P, G @ P_kf @ G.T, atol=1e-12)
+
+def test_gps_sigma_v_large_ignores_velocity():
+    eskf = make_eskf()
+    eskf.P = np.eye(15)
+    eskf.update_gps(p_meas=np.full(3, 1.0), v_meas=np.full(3, 1.0),
+                     sigma_p=0.01, sigma_v=1e4)
+
+    assert eskf.p == approx(np.full(3, 1.0), abs=1e-3)
+    assert eskf.v == approx(np.zeros(3), abs=1e-6)
+
+def test_gps_sigma_p_large_ignores_position():
+    eskf = make_eskf()
+    eskf.P = np.eye(15)
+    eskf.update_gps(p_meas=np.full(3, 1.0), v_meas=np.full(3, 1.0), sigma_p=1e4, sigma_v=0.01)
+
+    assert eskf.p == approx(np.zeros(3), abs=1e-6)
+    assert eskf.v == approx(np.full(3, 1.0), abs=1e-3)
+
+def test_gps_scalar_and_per_axis_sigma_match():
+      rng = np.random.default_rng(3)
+      p_meas, v_meas = rng.normal(size=3), rng.normal(size=3)
+      a, b = make_eskf(), make_eskf()
+
+      a.update_gps(p_meas, v_meas, sigma_p=0.5, sigma_v=0.1)
+      b.update_gps(p_meas, v_meas, sigma_p=np.full(3, 0.5), sigma_v=np.full(3, 0.1))
+
+      assert a.p == approx(b.p)
+      assert a.v == approx(b.v)
+      np.testing.assert_allclose(a.P, b.P)
+
+def test_gps_velocity_corrects_tilt():
+    eskf = make_eskf(sigma_a=1e-2, sigma_w=1e-3)
+    eskf.q = quat_from_rotvec(np.array([0.1, 0.0, 0.0]))
+    eskf.P = np.diag([1e-4] * 6 + [0.2 ** 2] * 3 + [1e-6] * 6)
+
+    for k in range(1000):
+          eskf._predict(a_meas=A_REST, w_meas=np.zeros(3), dt=0.01)
+          if k % 10 == 0:
+              eskf.update_gps(np.zeros(3), np.zeros(3), sigma_p=0.5, sigma_v=0.05)
+
+    roll, pitch, _ = quat_to_euler(eskf.q)
+    assert roll == approx(0.0, abs=1e-2)
+    assert pitch == approx(0.0, abs=1e-2)
+
+def test_gps_at_rest_does_not_observe_yaw():
+    eskf = make_eskf(sigma_a=1e-2, sigma_w=1e-3)
+    eskf.q = quat_from_rotvec(np.array([0.0, 0.0, 0.3]))
+    eskf.P = np.diag([1e-4] * 6 + [0.2 ** 2] * 3 + [1e-6] * 6)
+    P_yaw0 = eskf.P[8, 8]
+
+    for k in range(1000):
+        eskf._predict(a_meas=A_REST, w_meas=np.zeros(3), dt=0.01)
+        if k % 10 == 0:
+            eskf.update_gps(np.zeros(3), np.zeros(3), sigma_p=0.5, sigma_v=0.05)
+
+    assert quat_to_euler(eskf.q)[2] == approx(0.3, abs=1e-3)
+    assert eskf.P[8, 8] >= P_yaw0
