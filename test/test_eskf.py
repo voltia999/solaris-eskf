@@ -421,6 +421,41 @@ def test_accel_tilt_and_horizontal_bias_are_indistinguishable():
       roll_col, b_ay_col = H[:, 6], H[:, 10]
       assert np.linalg.matrix_rank(np.column_stack([roll_col, b_ay_col])) == 1
 
+@pytest.mark.parametrize("a_meas", [
+    A_REST * 6,                          # boost: gravity + 5 g of thrust along z
+    np.zeros(3),                         # coast: free fall, the accel reads ~0
+    A_REST + np.array([4.0, 0.0, 0.0]),  # horizontal acceleration: ||a|| = 10.59
+])
+def test_accel_rejected_with_linear_acceleration(a_meas):
+    # the accel measures specific force: with linear acceleration it is no longer just
+    # gravity, and h = R^T g + b_a would turn that acceleration into tilt or bias (sec. 4.5.2)
+    eskf = make_eskf()
+    eskf.P = np.diag([1e-4] * 6 + [0.2 ** 2] * 3 + [0.1 ** 2] * 3 + [1e-6] * 3)
+    q0, b_a0, P0 = eskf.q.copy(), eskf.b_a.copy(), eskf.P.copy()
+
+    assert eskf.update_accel(a_meas, sigma_a=0.05) is False
+    assert eskf.q == approx(q0)
+    assert eskf.b_a == approx(b_a0)
+    np.testing.assert_array_equal(eskf.P, P0)
+
+def test_accel_used_near_g():
+    eskf = make_eskf()
+    eskf.P = np.diag([1e-4] * 6 + [0.2 ** 2] * 3 + [1e-6] * 6)
+    P0 = eskf.P.copy()
+
+    assert eskf.update_accel(A_REST + np.array([0.1, -0.1, 0.2]), sigma_a=0.05) is True
+    assert np.trace(eskf.P) < np.trace(P0)
+
+def test_accel_threshold_is_configurable():
+    # 2 m/s^2 forward only changes the norm by 0.2 (sqrt(9.81^2 + 2^2) = 10.01) but tilts the
+    # vector by 11.5 deg: the threshold is necessary, not sufficient, so k has to be tuned
+    a_meas = A_REST + np.array([2.0, 0.0, 0.0])
+    loose = ESKF(0, 0, 0, 0, accel_threshold=0.5)
+    tight = ESKF(0, 0, 0, 0, accel_threshold=0.1)
+
+    assert loose.update_accel(a_meas, sigma_a=0.05) is True
+    assert tight.update_accel(a_meas, sigma_a=0.05) is False
+
 # generic update
 
 def random_filter(seed):
