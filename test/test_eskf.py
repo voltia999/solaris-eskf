@@ -288,3 +288,65 @@ def test_gps_at_rest_does_not_observe_yaw():
 
     assert quat_to_euler(eskf.q)[2] == approx(0.3, abs=1e-3)
     assert eskf.P[8, 8] >= P_yaw0
+
+
+# accel update
+
+def test_accel_finite_differences():
+    rng = np.random.default_rng(4)
+    eskf = make_eskf()
+    state = (rng.normal(size=3), rng.normal(size=3), quat_from_rotvec(rng.normal(size=3)),
+               rng.normal(size=3) * 0.1, rng.normal(size=3) * 0.01)
+    set_state(eskf, *state)
+
+    H_x = np.zeros((3, 16))
+    H_x[:, 6:10] = jacobian_rotT_vec_q(eskf.q, eskf.g)
+    H_x[:, 10:13] = np.eye(3)
+    H = eskf._observation_jacobian(H_x)
+
+    h = lambda p, v, q, b_a, b_g: rotation_matrix_hamilton(q).T @ eskf.g + b_a
+    eps = 1e-7
+    for i in range(15):
+        dx = np.zeros(15)
+        dx[i] = eps
+        dh = (h(*inject(*state, dx)) - h(*state)) / eps
+        np.testing.assert_allclose(H[:, i], dh, atol=1e-5, err_msg=f"column {i} of H")
+
+def test_accel_corrects_pitch_roll():
+    eskf = make_eskf()
+    eskf.q = quat_from_rotvec(np.array([0.1, 0.0, 0.0]))
+    eskf.P = np.diag([1e-4] * 6 + [0.2 ** 2] * 3 + [1e-6] * 6)
+
+    for i in range(1000):
+        eskf._predict(a_meas=A_REST, w_meas=np.zeros(3), dt=0.01)
+        if i % 10 == 0:
+            eskf.update_accel(a_meas=A_REST, sigma_a=0.05)
+
+    roll, pitch, _ = quat_to_euler(eskf.q)
+    assert roll == approx(0.0, abs=1e-2)
+    assert pitch == approx(0.0, abs=1e-2)
+
+def test_accel_corrects_pitch_roll():
+    eskf = make_eskf()
+    eskf.q = quat_from_rotvec(np.array([0.0, 0.0, 0.3]))
+    eskf.P = np.diag([1e-4] * 6 + [0.2 ** 2] * 3 + [1e-6] * 6)
+    P_yaw0 = eskf.P[8, 8]
+
+    for i in range(1000):
+        eskf._predict(a_meas=A_REST, w_meas=np.zeros(3), dt=0.01)
+        if i % 10 == 0:
+            eskf.update_accel(a_meas=A_REST, sigma_a=0.05)
+
+    assert quat_to_euler(eskf.q)[2] == approx(0.3, abs=1e-3)
+    assert eskf.P[8, 8] >= P_yaw0
+
+def test_accel_tilt_and_horizontal_bias_are_indistinguishable():
+      eskf = make_eskf()
+      H_x = np.zeros((3, 16))
+      H_x[:, 6:10] = jacobian_rotT_vec_q(eskf.q, eskf.g)
+      H_x[:, 10:13] = np.eye(3)
+      H = eskf._observation_jacobian(H_x)
+
+      roll_col, b_ay_col = H[:, 6], H[:, 10]
+      assert np.linalg.matrix_rank(np.column_stack([roll_col, b_ay_col])) == 1
+
