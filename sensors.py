@@ -8,8 +8,8 @@ class Sensor():
     ts: float
     data: np.ndarray
     sigma: float | np.ndarray
-    flag: bool = False
     last_ts: float
+    flag: bool = False
 
     def new_meas(self, ts, data):
         self.ts, self.data = ts, data
