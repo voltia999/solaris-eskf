@@ -44,7 +44,7 @@ class ESKF():
         self.P = Phi @ self.P @ Phi.T + self.F_i @ Q_i @ self.F_i.T
 
     def update_gps(self, p_meas, v_meas, sigma_p, sigma_v):
-        # h(x) = p
+        # h(x) = [p; v] (eq. 67)
         y = np.concatenate([p_meas, v_meas])
         h_x = np.concatenate([self.p, self.v])
 

@@ -270,14 +270,15 @@ def test_baro_accepts_array_measurement():
 # gps update
 
 def test_gps_linear_kf():
+    rng = np.random.default_rng(9)
     eskf = make_eskf()
-    eskf.p = np.random.normal(size=3)
-    eskf.v = np.random.normal(size=3)
-    A = np.random.normal(size=(15, 15))
+    eskf.p = rng.normal(size=3)
+    eskf.v = rng.normal(size=3)
+    A = rng.normal(size=(15, 15))
     eskf.P = A @ A.T + np.eye(15)
 
-    p_meas = eskf.p + np.random.normal(size=3)
-    v_meas = eskf.v + np.random.normal(size=3)
+    p_meas = eskf.p + rng.normal(size=3)
+    v_meas = eskf.v + rng.normal(size=3)
     sigma_p, sigma_v = 0.7, 0.2
 
     x0 = np.concatenate([eskf.p, eskf.v])
