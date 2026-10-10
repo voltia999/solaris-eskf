@@ -8,8 +8,8 @@ Convenciones: NED, `R(q)` lleva de cuerpo a NED, `g = [0, 0, -9.81]` (reacción 
 
 ## 0. Tests existentes que hay que corregir
 
-- [ ] **`predict` → `_predict`.** `test_rest`, `test_rotation`, `test_quat_norm`, `run_noisy`, `test_covariance_gyro_noise_only`, `test_transition_matrix_finite_differences` y `test_mag_corrects_yaw` llaman a `eskf.predict(...)`. Hay que actualizarlos, o volver a hacer pública `predict` (recomendado: los tests y el caso de solo IMU la usan).
-- [ ] **`sensors.py` no se puede importar** (`last_ts` sin valor por defecto después de `flag`), así que pytest no recoge ningún test hasta arreglarlo.
+- [x] **`predict` → `_predict`.** `test_rest`, `test_rotation`, `test_quat_norm`, `run_noisy`, `test_covariance_gyro_noise_only`, `test_transition_matrix_finite_differences` y `test_mag_corrects_yaw` llaman a `eskf.predict(...)`. Hay que actualizarlos, o volver a hacer pública `predict` (recomendado: los tests y el caso de solo IMU la usan).
+- [x] **`sensors.py` no se puede importar** (`last_ts` sin valor por defecto después de `flag`), así que pytest no recoge ningún test hasta arreglarlo.
 
 ## 1. Updates sin test
 
@@ -63,12 +63,13 @@ Convenciones: NED, `R(q)` lleva de cuerpo a NED, `g = [0, 0, -9.81]` (reacción 
 ## 5. Para código que aún no existe
 
 - [ ] **`run()` + `Sensor`:**
-  - llama al `update_<kind>` correcto
-  - cada medida se aplica una sola vez (`last_ts`)
-  - `kind` desconocido → error
-  - dos medidas consecutivas con el mismo valor se aplican las dos (se decide por timestamp, no por valor)
-  - **GPS a través de `run()`:** ahora mismo `run()` llama a `update_<kind>(s.data, s.sigma)`, con dos argumentos, pero `update_gps` pide cuatro. Este test fallará hasta que una de las dos firmas cambie (por ejemplo, `update_gps(y, sigma)` con `y = [p; v]` y `sigma` de 6 elementos).
-- [ ] **Umbral del acelerómetro (4.5.2).**
+  - [x] una sola actualización apilada por paso (`test_run_stacks_all_measurements_in_one_update`)
+  - [x] el magnetómetro solo con acelerómetro aceptado (`test_run_drops_mag_*`, `test_run_uses_mag_with_accel_and_corrects_yaw`)
+  - [x] cada medida se aplica una sola vez (`last_ts`) (`test_run_ignores_already_used_measurements`)
+  - [x] GPS a través de `run()`: `data = [p; v]`, `sigma = (sigma_p, sigma_v)` (incluido en el test de apilado)
+  - [ ] `kind` desconocido → error
+  - [ ] dos medidas consecutivas con el mismo valor se aplican las dos (se decide por timestamp, no por valor)
+- [x] **Umbral del acelerómetro (4.5.2).** (`test_accel_rejected_with_linear_acceleration`, `test_accel_threshold_is_configurable`)
   Si `| ‖a‖ − g | ≥ k` hay aceleración lineal, el acelerómetro ya no mide solo gravedad, y usarlo inclinaría la actitud estimada. Se descarta la medida.
 - [ ] **Inicialización (sección 5).**
   - `b_g0` = media del giróscopo en reposo (la velocidad angular verdadera es 0 si se ignora la rotación terrestre).

@@ -9,3 +9,6 @@ dist/
 .vscode/
 .idea/
 .DS_Store
+
+# local verification scripts for the PDF review
+scripts/

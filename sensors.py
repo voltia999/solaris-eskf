@@ -10,10 +10,12 @@ class Sensor():
     consecutive equal readings are both used.
 
     Attributes:
-        kind: Sensor name; ESKF.run calls ESKF.update_<kind> ("mag", "accel", "baro", ...).
+        kind: Sensor name; ESKF.run calls ESKF._meas_<kind> ("accel", "mag", "baro", "gps").
         ts: Timestamp of the latest measurement (s).
-        data: Latest measurement, passed as the first argument of update_<kind>.
-        sigma: Measurement noise std, passed as the second argument of update_<kind>.
+        data: Latest measurement, passed as the first argument of _meas_<kind>. For the
+            GPS, [p, v] in NED, shape (6,).
+        sigma: Measurement noise std, passed as the second argument of _meas_<kind>. For
+            the GPS, the pair (sigma_p, sigma_v).
         last_ts: Timestamp of the last measurement used by the filter (s).
         flag: Unused.
     """
