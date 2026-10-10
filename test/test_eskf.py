@@ -250,12 +250,37 @@ def error_between(nominal, perturbed):
         perturbed.b_g - nominal.b_g,
     ])
 
-def test_transition_matrix_finite_differences():
-    """Φ is the Jacobian of the discrete propagation (sec. 3.5.2).
+def propagation_jacobian(state, a_meas, w_meas, dt, substeps, eps=1e-6):
+    """Finite-difference Jacobian of propagating the error over dt in `substeps` Euler steps.
 
-    Perturbs each of the 15 error components by ε, propagates nominal and perturbed one step
-    and checks that the propagated error equals Φ·δx. Arbitrary state and IMU input, so every
-    block of Φ is non-zero.
+    One substep is the exact Jacobian of _predict; many substeps approximate the continuous
+    dynamics.
+
+    Returns:
+        J, shape (15, 15).
+    """
+    def propagate(st):
+        eskf = make_eskf()
+        set_state(eskf, *st)
+        for _ in range(substeps):
+            eskf._predict(a_meas, w_meas, dt / substeps)
+        return eskf
+
+    nominal = propagate(state)
+    return np.array([error_between(nominal, propagate(inject(*state, eps * e))) / eps
+                     for e in np.eye(15)]).T
+
+# Φ blocks with the Δt² terms of eq. 32: (p, θ), (p, b_a), (v, b_g)
+SECOND_ORDER_BLOCKS = [(slice(0, 3), slice(6, 9)), (slice(0, 3), slice(9, 12)),
+                       (slice(3, 6), slice(12, 15))]
+
+def test_transition_matrix_finite_differences():
+    """Φ is the Jacobian of the propagation (sec. 3.5.2, eq. 32).
+
+    The first-order blocks are the exact Jacobian of the Euler step in _predict. The Δt²
+    blocks are not in that step: they are checked against the continuous dynamics
+    (many substeps), which they match far better than the zero of a first-order Φ.
+    Arbitrary state and IMU input, so every block of Φ is non-zero.
     """
     rng = np.random.default_rng(1)
     dt = 0.01
@@ -268,18 +293,16 @@ def test_transition_matrix_finite_differences():
     set_state(nominal, *state)
     nominal.R = rotation_matrix_hamilton(nominal.q)
     Phi = nominal._transition_matrix(a_meas - nominal.b_a, (w_meas - nominal.b_g) * dt, dt)
-    nominal._predict(a_meas, w_meas, dt)
 
-    eps = 1e-6
-    for i in range(15):
-        dx = np.zeros(15)
-        dx[i] = eps
-        perturbed = make_eskf()
-        set_state(perturbed, *inject(*state, dx))
-        perturbed._predict(a_meas, w_meas, dt)
+    J_euler = propagation_jacobian(state, a_meas, w_meas, dt, substeps=1)
+    J_cont = propagation_jacobian(state, a_meas, w_meas, dt, substeps=1000)
 
-        np.testing.assert_allclose(error_between(nominal, perturbed), Phi @ dx, atol=1e-10,
-                                   err_msg=f"column {i} of Phi")
+    Phi_first = Phi.copy()
+    for rows, cols in SECOND_ORDER_BLOCKS:
+        Phi_first[rows, cols] = 0
+        np.testing.assert_allclose(Phi[rows, cols], J_cont[rows, cols], atol=1e-5,
+                                   err_msg=f"Δt² block {rows}, {cols} of Phi")
+    np.testing.assert_allclose(Phi_first, J_euler, atol=1e-4, err_msg="first-order blocks of Phi")
 
 
 # magnetometer update
@@ -818,10 +841,13 @@ def test_accel_bias_z_converges_with_baro():
 def test_accel_bias_horizontal_unobservable_with_baro_only():
     """With only the baro the horizontal b_a stays unestimated.
 
-    A horizontal bias drifts x and y, which the baro never sees.
+    A horizontal bias drifts x and y, which the baro never sees. The measured specific force
+    has a horizontal component (the bias), so the Δt² block (p, θ) couples z with the tilt and
+    the tilt with the horizontal b_a: the estimate moves, but orders of magnitude less than
+    the true bias (0.05).
     """
     eskf, _ = run_ba({"baro"})
-    assert eskf.b_a[0:2] == approx(np.zeros(2), abs=1e-6)
+    assert eskf.b_a[0:2] == approx(np.zeros(2), abs=1e-4)
 
 def test_accel_bias_converges_with_gps():
     """GPS makes all of b_a converge.
@@ -832,3 +858,85 @@ def test_accel_bias_converges_with_gps():
     """
     eskf, b_a_true = run_ba({"gps"})
     assert eskf.b_a == approx(b_a_true, abs=1e-2)
+
+
+# run: one stacked update per step and magnetometer rule (sec. 4.5.3)
+
+from sensors import Sensor
+
+def make_run_eskf():
+    """Filter at rest and level with the magnetometer enabled and a broad P."""
+    eskf = ESKF(sigma_a=1e-2, sigma_w=1e-3, sigma_aw=1e-4, sigma_ww=1e-5, mag_ref=MAG_REF)
+    eskf.P = np.eye(15) * 0.1
+    return eskf
+
+def sensor(kind, data, sigma, ts=1.0, last_ts=0.0):
+    return Sensor(kind=kind, ts=ts, data=np.asarray(data, dtype=float), sigma=sigma, last_ts=last_ts)
+
+def count_updates(eskf):
+    """Wrap _update to record the size of each measurement vector it receives."""
+    sizes, original = [], eskf._update
+    def wrapped(y, h_x, H, V):
+        sizes.append(len(y))
+        original(y, h_x, H, V)
+    eskf._update = wrapped
+    return sizes
+
+def test_run_stacks_all_measurements_in_one_update():
+    """Accel, mag, baro and GPS in the same step give a single update of 3+3+1+6 rows."""
+    eskf = make_run_eskf()
+    sizes = count_updates(eskf)
+    sensors = [sensor("accel", A_REST, 0.1), sensor("mag", MAG_REF, 0.5),
+               sensor("baro", [0.0], 0.5), sensor("gps", np.zeros(6), (1.0, 0.1))]
+
+    used = eskf.run(A_REST, np.zeros(3), 0.01, sensors)
+
+    assert used == ["accel", "mag", "baro", "gps"]
+    assert sizes == [13]
+    assert all(s.last_ts == s.ts for s in sensors)
+
+def test_run_drops_mag_without_accel():
+    """With only the magnetometer the step is pure prediction, and the reading is consumed."""
+    eskf, ref = make_run_eskf(), make_run_eskf()
+    sizes = count_updates(eskf)
+    mag = sensor("mag", MAG_REF, 0.5)
+
+    used = eskf.run(A_REST, np.zeros(3), 0.01, [mag])
+    ref._predict(A_REST, np.zeros(3), 0.01)
+
+    assert used == [] and sizes == []
+    assert mag.last_ts == mag.ts
+    np.testing.assert_allclose(eskf.P, ref.P)
+
+def test_run_drops_mag_when_accel_rejected():
+    """A rejected accelerometer (boost: ‖a‖ far from g) also drops the mag, not the others."""
+    eskf = make_run_eskf()
+    sizes = count_updates(eskf)
+    boost = A_REST * 3
+    sensors = [sensor("accel", boost, 0.1), sensor("mag", MAG_REF, 0.5), sensor("baro", [0.0], 0.5)]
+
+    used = eskf.run(boost, np.zeros(3), 0.01, sensors)
+
+    assert used == ["baro"]
+    assert sizes == [1]
+    assert all(s.last_ts == s.ts for s in sensors)
+
+def test_run_uses_mag_with_accel_and_corrects_yaw():
+    """With an accepted accelerometer the magnetometer is fused and corrects a yaw error."""
+    eskf = make_run_eskf()
+    eskf.q = quat_from_rotvec(np.array([0, 0, 0.2]))
+    sensors = [sensor("accel", A_REST, 0.1), sensor("mag", MAG_REF, 0.5)]
+
+    used = eskf.run(A_REST, np.zeros(3), 0.01, sensors)
+
+    assert used == ["accel", "mag"]
+    assert abs(quat_to_euler(eskf.q)[2]) < 0.2 / 2
+
+def test_run_ignores_already_used_measurements():
+    """A sensor whose ts is not newer than last_ts is not fused again."""
+    eskf = make_run_eskf()
+    sizes = count_updates(eskf)
+
+    used = eskf.run(A_REST, np.zeros(3), 0.01, [sensor("baro", [0.0], 0.5, ts=1.0, last_ts=1.0)])
+
+    assert used == [] and sizes == []

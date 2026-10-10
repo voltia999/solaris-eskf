@@ -102,17 +102,7 @@ class ESKF():
             sigma_p: Position noise std (m), scalar or per axis (3,).
             sigma_v: Velocity noise std (m/s), scalar or per axis (3,).
         """
-        # h(x) = [p; v] (eq. 67)
-        y = np.concatenate([p_meas, v_meas])
-        h_x = np.concatenate([self.p, self.v])
-
-        H_x = np.zeros((6, 16))
-        H_x[:3, 0:3] = np.eye(3)
-        H_x[3:, 3:6] = np.eye(3)
-        H = self._observation_jacobian(H_x)
-
-        V = np.diag(np.concatenate([np.broadcast_to(sigma_p, 3), np.broadcast_to(sigma_v, 3)]) ** 2)
-        self._update(y, h_x, H, V)
+        self._fuse([self._meas_gps(np.concatenate([p_meas, v_meas]), (sigma_p, sigma_v))])
 
     def update_mag(self, m_meas, sigma_mag):
         """Correct the attitude with a magnetometer measurement (sec. 4.1).
@@ -121,6 +111,9 @@ class ESKF():
         R(q) in eq. 53; the transpose is the NED-to-body rotation). The measurement
         must be calibrated (hard/soft iron removed) and in the units of mag_ref.
 
+        Applies the measurement on its own. In run it is only used together with an
+        accepted accelerometer measurement (sec. 4.5.3).
+
         Args:
             m_meas: Magnetic field in body axes, shape (3,).
             sigma_mag: Noise std, scalar or per axis (3,).
@@ -128,19 +121,7 @@ class ESKF():
         Raises:
             ValueError: If mag_ref is not set.
         """
-        # h(x) = R(q)^T r: Earth field (NED) seen in body axes
-        if self.mag_ref is None:
-            raise ValueError("mag_ref (Earth magnetic field in NED) is not set")
-
-        h_x = rotation_matrix_hamilton(self.q).T @ self.mag_ref
-
-        H_x = np.zeros((3, 16))
-        H_x[:, 6:10] = jacobian_rotT_vec_q(self.q, self.mag_ref)
-        H = self._observation_jacobian(H_x)
-
-        V = np.diag(np.broadcast_to(sigma_mag, 3) ** 2)
-
-        self._update(m_meas, h_x, H, V)
+        self._fuse([self._meas_mag(m_meas, sigma_mag)])
 
     def update_accel(self, a_meas, sigma_a):
         """Correct roll, pitch and b_a using the accelerometer as a gravity sensor (sec. 4.2).
@@ -158,20 +139,10 @@ class ESKF():
         Returns:
             True if the measurement was used, False if it was rejected.
         """
-        # h(x) = R(q)^T g + b_a: only valid without linear acceleration, so the measurement
-        # is skipped when its norm is far from g (sec. 4.5.2). Returns whether it was used
-        if abs(np.linalg.norm(a_meas) - np.linalg.norm(self.g)) >= self.accel_threshold:
+        meas = self._meas_accel(a_meas, sigma_a)
+        if meas is None:
             return False
-
-        h_x = rotation_matrix_hamilton(self.q).T @ self.g + self.b_a
-
-        H_x = np.zeros((3,16))
-        H_x[:, 6:10] = jacobian_rotT_vec_q(self.q, self.g)
-        H_x[:, 10:13] = np.eye(3)
-        H = self._observation_jacobian(H_x)
-
-        V = np.diag(np.broadcast_to(sigma_a, 3) ** 2)
-        self._update(a_meas, h_x, H, V)
+        self._fuse([meas])
         return True
 
     def update_baro(self, z_meas, sigma_baro):
@@ -182,38 +153,140 @@ class ESKF():
                 (appendix B): z = -(altitude - altitude_ref). Scalar or shape (1,).
             sigma_baro: Noise std (m).
         """
-
-        h_x = self.p[2:3]
-
-        H_x = np.zeros((1, 16))
-        H_x[0, 2] = 1.0
-        H = self._observation_jacobian(H_x)
-
-        V = np.array([[sigma_baro ** 2]])
-
-        self._update(np.atleast_1d(z_meas), h_x, H, V)
+        self._fuse([self._meas_baro(z_meas, sigma_baro)])
 
     def run(self, a_meas, w_meas, dt, sensors: Sensor):
         """Run one filter step: predict with the IMU, then fuse the new measurements.
 
-        Each sensor with a measurement newer than the last one used is applied in the
-        given order through update_<kind>(data, sigma), and marked as used.
+        Sec. 4.5.3: the sensors with a measurement newer than the last one used are
+        stacked into a single update (eq. 75-77, V block diagonal), and the
+        magnetometer is only used if the accelerometer is used in the same step (it
+        has new data and passes the threshold of sec. 4.5.2). Every new measurement is
+        marked as used, also the rejected ones, so it is not applied in a later step.
 
         Args:
             a_meas: Accelerometer measurement in body axes (m/s²).
             w_meas: Gyroscope measurement in body axes (rad/s).
             dt: Time since the previous IMU sample (s).
-            sensors: Iterable of Sensor. Each kind must have an update_<kind> method
+            sensors: Iterable of Sensor. Each kind must have a _meas_<kind> method
                 taking (data, sigma).
+
+        Returns:
+            Kinds of the measurements fused in this step, in the given order.
         """
         self._predict(a_meas=a_meas, w_meas=w_meas, dt=dt)
 
+        meas = {}
         for s in sensors:
             if s.has_new_data():
-                getattr(self, f"update_{s.kind}")(s.data, s.sigma)
+                m = getattr(self, f"_meas_{s.kind}")(s.data, s.sigma)
+                if m is not None:
+                    meas[s.kind] = m
                 s.last_ts = s.ts
 
+        # the magnetometer alone does not observe roll and pitch (sec. 4.5.3)
+        if "accel" not in meas:
+            meas.pop("mag", None)
 
+        if meas:
+            self._fuse(list(meas.values()))
+        return list(meas)
+
+    def _meas_gps(self, data, sigma):
+        """GPS measurement terms, h(x) = [p; v] (eq. 67-69).
+
+        Args:
+            data: [p, v] in NED (m, m/s), shape (6,).
+            sigma: (sigma_p, sigma_v), each scalar or per axis (3,).
+
+        Returns:
+            (y, h(x), H_x, V) with H_x w.r.t. the nominal state, shape (6, 16).
+        """
+        sigma_p, sigma_v = sigma
+        h_x = np.concatenate([self.p, self.v])
+
+        H_x = np.zeros((6, 16))
+        H_x[:3, 0:3] = np.eye(3)
+        H_x[3:, 3:6] = np.eye(3)
+
+        V = np.diag(np.concatenate([np.broadcast_to(sigma_p, 3), np.broadcast_to(sigma_v, 3)]) ** 2)
+        return np.asarray(data, dtype=float), h_x, H_x, V
+
+    def _meas_mag(self, m_meas, sigma_mag):
+        """Magnetometer measurement terms, h(x) = R(q)ᵀ mag_ref (sec. 4.1).
+
+        Returns:
+            (y, h(x), H_x, V), H_x shape (3, 16).
+
+        Raises:
+            ValueError: If mag_ref is not set.
+        """
+        # h(x) = R(q)^T r: Earth field (NED) seen in body axes
+        if self.mag_ref is None:
+            raise ValueError("mag_ref (Earth magnetic field in NED) is not set")
+
+        h_x = rotation_matrix_hamilton(self.q).T @ self.mag_ref
+
+        H_x = np.zeros((3, 16))
+        H_x[:, 6:10] = jacobian_rotT_vec_q(self.q, self.mag_ref)
+
+        V = np.diag(np.broadcast_to(sigma_mag, 3) ** 2)
+        return m_meas, h_x, H_x, V
+
+    def _meas_accel(self, a_meas, sigma_a):
+        """Accelerometer measurement terms, h(x) = R(q)ᵀ g + b_a (sec. 4.2).
+
+        Returns:
+            (y, h(x), H_x, V), H_x shape (3, 16), or None if the measurement is
+            rejected by the threshold (sec. 4.5.2).
+        """
+        # only valid without linear acceleration: skipped when its norm is far from g
+        if abs(np.linalg.norm(a_meas) - np.linalg.norm(self.g)) >= self.accel_threshold:
+            return None
+
+        h_x = rotation_matrix_hamilton(self.q).T @ self.g + self.b_a
+
+        H_x = np.zeros((3, 16))
+        H_x[:, 6:10] = jacobian_rotT_vec_q(self.q, self.g)
+        H_x[:, 10:13] = np.eye(3)
+
+        V = np.diag(np.broadcast_to(sigma_a, 3) ** 2)
+        return a_meas, h_x, H_x, V
+
+    def _meas_baro(self, z_meas, sigma_baro):
+        """Barometer measurement terms, h(x) = p_z (eq. 71-73).
+
+        Returns:
+            (y, h(x), H_x, V), H_x shape (1, 16).
+        """
+        h_x = self.p[2:3]
+
+        H_x = np.zeros((1, 16))
+        H_x[0, 2] = 1.0
+
+        V = np.array([[sigma_baro ** 2]])
+        return np.atleast_1d(z_meas), h_x, H_x, V
+
+    def _fuse(self, measurements):
+        """Stack several measurements into a single update (eq. 75-77).
+
+        All the terms are evaluated at the same nominal state, before any correction.
+        The noise of different sensors is independent, so V is block diagonal.
+
+        Args:
+            measurements: List of (y, h(x), H_x, V) from the _meas_<kind> methods.
+        """
+        ys, hs, Hs, Vs = zip(*measurements)
+        m = sum(len(y) for y in ys)
+        V = np.zeros((m, m))
+        i = 0
+        for Vk in Vs:
+            n = Vk.shape[0]
+            V[i:i + n, i:i + n] = Vk
+            i += n
+
+        H = self._observation_jacobian(np.vstack(Hs))
+        self._update(np.concatenate(ys), np.concatenate(hs), H, V)
 
     def _update(self, y, h_x, H, V):
         """Kalman correction, error injection and reset (sec. 3.6).
@@ -251,9 +324,9 @@ class ESKF():
     def _transition_matrix(self, a, theta, dt):
         """Error-state transition matrix Φ for one step (sec. 3.5.2).
 
-        First-order, 15-state Jacobian of the discrete propagation in _predict (the
-        PDF's eq. 32 is the 18-state version with gravity and Δt² terms). Uses self.R,
-        which _predict sets before calling it.
+        Second-order (Δt²) expansion of eq. 32 without the gravity error state, which
+        is not estimated (15 states instead of 18). Uses self.R, which _predict sets
+        before calling it.
 
         Args:
             a: Bias-corrected specific force in body axes (m/s²).
@@ -265,10 +338,14 @@ class ESKF():
         """
         I3 = np.eye(3)
         Phi = np.eye(15)
+        R_a = self.R @ skew(a)
 
         Phi[0:3, 3:6] = I3 * dt
-        Phi[3:6, 6:9] = -self.R @ skew(a) * dt
+        Phi[0:3, 6:9] = -0.5 * R_a * dt ** 2
+        Phi[0:3, 9:12] = -0.5 * self.R * dt ** 2
+        Phi[3:6, 6:9] = -R_a * dt
         Phi[3:6, 9:12] = -self.R * dt
+        Phi[3:6, 12:15] = 0.5 * R_a * dt ** 2
         Phi[6:9, 6:9] = rotation_matrix_hamilton(quat_from_rotvec(theta)).T
         Phi[6:9, 12:15] = -I3 * dt
 
