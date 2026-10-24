@@ -9,3 +9,6 @@ dist/
 .vscode/
 .idea/
 .DS_Store
+
+# documents, not published
+docs/

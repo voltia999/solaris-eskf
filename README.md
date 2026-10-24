@@ -6,7 +6,7 @@ Implementación en Python de un filtro de Kalman de estado de error (ESKF) de 15
 
 **Actualizaciones disponibles:** GPS (posición), magnetómetro, acelerómetro (gravedad) y barómetro (altura).
 
-La formulación matemática completa está en [`docs/ESKF.pdf`](docs/ESKF.pdf).
+La formulación matemática completa está en `docs/ESKF.pdf`, todavía no publicado.
 
 ## Estructura
 
@@ -15,7 +15,7 @@ eskf.py            # Clase ESKF: predicción y actualizaciones
 quaternion.py      # Operaciones con cuaterniones y jacobianos
 linalg_utils.py    # Utilidades de álgebra lineal (matriz antisimétrica)
 test/              # Tests con pytest
-docs/ESKF.pdf      # Documento con la derivación
+docs/ESKF.pdf      # Documento con la derivación (no publicado)
 ```
 
 ## Instalación
